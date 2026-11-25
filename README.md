@@ -121,6 +121,7 @@ Data lives in the Docker volumes `alvic-devbox-home` (your home folder and repos
 |---|---|
 | Install says *First install needs TS_AUTHKEY* | Generate an auth key in the Tailscale admin console and pass it as shown above. |
 | `tailscale serve failed` in `docker logs alvic-devbox` | Turn on **HTTPS Certificates** in the Tailscale admin console → DNS, then re-run the install. |
+| SSL error from the phone (certificate still pending: `docker logs alvic-devbox` shows ACME errors) | Use `http://alvic-devbox.<tailnet>.ts.net` instead. It is still tailnet-only and encrypted by WireGuard, and needs no certificate. |
 | Alvic can't reach the devbox | Make sure the Tailscale app on the phone is connected. Check `docker logs alvic-devbox`. |
 | Lost the token | `sudo cat /etc/alvic-devbox/token` on the VPS. |
 | A private repo won't clone | Run `gh auth login` in the devbox terminal first. |
