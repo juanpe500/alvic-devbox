@@ -43,8 +43,9 @@ Built to share a box with a running app (for example a QA server) without touchi
   `tailscale serve` (tailnet HTTPS). Funnel (public exposure) is never enabled.
 - **Firewall.** Nothing new can enter the devbox network, and the devbox cannot open
   connections to the host itself or to any private or LAN range. Your other services and
-  databases on the same machine are unreachable from inside. Outbound internet (git, pip,
-  npm, Claude, deploy CLIs) works.
+  databases on the same machine are unreachable from inside. The one exception is the host's
+  own SSH (port 22, still key-only), so deploy scripts can reach that box like any other
+  server. Outbound internet (git, pip, npm, Claude, deploy CLIs) works.
 - **Resource limits.** cgroup caps on CPU, memory and process count, so the host's own
   workloads keep their headroom.
 - **No host access.** No Docker socket, no host mounts, no `--privileged`, no `NET_ADMIN`.

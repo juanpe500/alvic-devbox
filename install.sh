@@ -137,9 +137,12 @@ for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10;
 done
 iptables -I DOCKER-USER 1 -j ALVIC-DEVBOX
 
-# Traffic addressed to the host (QA web server, its DB, ssh…): replies only.
+# Traffic addressed to the host (its web apps, DB, Redis…): replies only — except the host's
+# own SSH, so deploy scripts in the devbox can reach this box like any other server. sshd is
+# already open to the internet and still needs a key, so this exposes nothing new.
 iptables -N ALVIC-DEVBOX-IN
 iptables -A ALVIC-DEVBOX-IN -i "\$BR" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A ALVIC-DEVBOX-IN -i "\$BR" -p tcp --dport 22 -j ACCEPT
 iptables -A ALVIC-DEVBOX-IN -i "\$BR" -j DROP
 iptables -I INPUT 1 -j ALVIC-DEVBOX-IN
 EOF
