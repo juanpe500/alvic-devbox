@@ -32,6 +32,9 @@ tailscale funnel reset >/dev/null 2>&1 || true
 if ! tailscale serve --bg 7777; then
     echo "devbox: 'tailscale serve' failed — enable HTTPS certificates in the tailnet admin console" >&2
 fi
+# Plain HTTP too, still tailnet-only (WireGuard already encrypts end to end). Lets the phone
+# connect even while the Let's Encrypt certificate for the HTTPS name is pending or failing.
+tailscale serve --bg --http=80 7777 || true
 
 unset TS_AUTHKEY
 
