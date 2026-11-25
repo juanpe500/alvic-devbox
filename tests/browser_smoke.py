@@ -138,6 +138,11 @@ try:
         time.sleep(1)
     g = next((t for t in c.get("/browser").json()["tabs"] if t["owner"] == "gamma-1"), {})
     check("turn end releases the tab", g.get("active") is False and g.get("name") == "gamma", str(g))
+    reg = json.loads(reg_path.read_text())
+    reg.pop("gamma-1", None)
+    reg_path.write_text(json.dumps(reg))
+    (state_dir / "gamma-1.json").unlink(missing_ok=True)
+    c.delete("/browser/tabs/gamma-1")
 
     # live view
     async def view():
@@ -162,6 +167,39 @@ try:
             st = c.get("/browser").json()
             watched = next((t for t in st["tabs"] if t["owner"] == "me-test"), {})
             return got_meta, got_frame, seen_nav, watched.get("viewers")
+
+    # follow mode (split screen): only attaches to an open tab, animates actions, doesn't pin it
+    async def follow():
+        async with websockets.connect("ws://127.0.0.1:7799/browser/view/nobody?token=testtoken&follow=1") as ws:
+            closed_for_missing = json.loads(await asyncio.wait_for(ws.recv(), 10)).get("type") == "closed"
+        tool("delta", "browser_navigate", url=URL + "index.html")
+        async with websockets.connect("ws://127.0.0.1:7799/browser/view/delta?token=testtoken&follow=1", max_size=None) as ws:
+            frame = False
+            end = time.time() + 15
+            while time.time() < end and not frame:
+                frame = isinstance(await asyncio.wait_for(ws.recv(), 15), bytes)
+            t = time.time()
+            res, text = await asyncio.to_thread(lambda: tool("delta", "browser_type", selector="#name", text="Watched"))
+            typed_slowly = time.time() - t > 0.5
+            await asyncio.to_thread(lambda: tool("delta", "browser_click", selector="#go"))
+            _, read = await asyncio.to_thread(lambda: tool("delta", "browser_read"))
+            hud_hidden = "hi Watched" in read and "reading page" not in read and "clicked" not in read
+            pinned = any(t["owner"] == "delta" and t["active"] for t in c.get("/browser").json()["tabs"])
+            await asyncio.to_thread(lambda: tool("delta", "browser_close"))
+            got_closed = False
+            end = time.time() + 10
+            while time.time() < end and not got_closed:
+                msg = await asyncio.wait_for(ws.recv(), 10)
+                got_closed = isinstance(msg, str) and json.loads(msg).get("type") == "closed"
+            return closed_for_missing, frame, typed_slowly, hud_hidden, pinned, got_closed, read
+
+    missing, fframe, slow, hidden, pinned, fclosed, read = asyncio.run(follow())
+    check("follow: no open tab → closed", missing)
+    check("follow: frames from an open tab", fframe)
+    check("watched typing is animated (real keystrokes)", slow)
+    check("HUD never shows up in browser_read", hidden, read[:200])
+    check("follow: tab still open while followed", pinned)
+    check("follow: told when the tab closes", fclosed)
 
     got_meta, got_frame, seen_nav, viewers = asyncio.run(view())
     check("live view sends page info and frames", got_meta and got_frame, f"{got_meta} {got_frame}")

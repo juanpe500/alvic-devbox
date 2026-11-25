@@ -89,8 +89,12 @@ class Tab:
         self.owner = owner
         self.page = page
         self.last_used = time.time()
-        self.viewers = 0
+        self.viewers = 0     # full-screen watchers: they keep the tab open
+        self.followers = 0   # split-screen watchers: animate, but let the tab close on its own
         self.lock = asyncio.Lock()
+
+    def watched(self) -> bool:
+        return self.viewers + self.followers > 0
 
 
 class Pool:
@@ -275,7 +279,7 @@ class Pool:
                 "owner": owner, "kind": kind,
                 "name": (info.get(owner) or {}).get("name") or meta.get("title") or owner,
                 "session_state": (info.get(owner) or {}).get("state"),
-                "active": live is not None, "viewers": live.viewers if live else 0,
+                "active": live is not None, "viewers": (live.viewers + live.followers) if live else 0,
                 "url": meta.get("url", ""), "title": meta.get("title", ""),
                 "ts": int(live.last_used if live else meta.get("ts", 0)),
                 "has_shot": live is not None or (TABS_DIR / owner / "shot.jpg").exists(),
@@ -394,8 +398,136 @@ def _text(value) -> dict:
     return {"type": "text", "text": value if isinstance(value, str) else json.dumps(value, default=str)}
 
 
+# Visual feedback while someone watches (same idea as chrome-browser's HUD): a fake cursor that
+# glides to each target, smooth scrolling, highlight boxes, click ripples and toasts. It lives in
+# a closed shadow root, so page CSS can't touch it and browser_read never sees its text.
+HUD_JS = r"""
+(() => {
+  const V = 1;
+  if (window.__DBHUD && window.__DBHUD.v === V) return true;
+  const Z = 2147483600, HOLD = 2200, sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const host = document.createElement('devbox-hud');
+  Object.assign(host.style, {position: 'fixed', inset: '0', pointerEvents: 'none', zIndex: String(Z)});
+  (document.body || document.documentElement).appendChild(host);
+  const root = host.attachShadow({mode: 'closed'});
+  const mk = (style) => { const e = document.createElement('div'); Object.assign(e.style, style); root.appendChild(e); return e; };
+  const label = (el) => (el.getAttribute('aria-label') || (el.labels && el.labels[0] && el.labels[0].innerText)
+                         || el.getAttribute('placeholder') || el.innerText || el.value
+                         || el.getAttribute('name') || el.tagName || '').toString().trim().replace(/\s+/g, ' ').slice(0, 40);
+  const H = {
+    v: V,
+    cursor() {
+      if (!this.c) {
+        this.c = mk({position: 'fixed', left: '50%', top: '40%', width: '22px', height: '22px', zIndex: String(Z + 5),
+          transform: 'translate(-3px,-2px)', filter: 'drop-shadow(0 2px 3px rgba(0,0,0,.45))',
+          transition: 'left .5s cubic-bezier(.22,.61,.36,1), top .5s cubic-bezier(.22,.61,.36,1)'});
+        this.c.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22"><path d="M5 3l14 8-6 1.5L9.5 19 5 3z" fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg>';
+      }
+      return this.c;
+    },
+    pos() { const c = this.cursor(); return {x: parseFloat(c.style.left) || innerWidth / 2, y: parseFloat(c.style.top) || innerHeight * .4}; },
+    async moveTo(x, y) { const c = this.cursor(); c.style.left = Math.round(x) + 'px'; c.style.top = Math.round(y) + 'px'; await sleep(480); },
+    async scrollTo(el) {
+      const r = el.getBoundingClientRect();
+      if (r.top < 0 || r.left < 0 || r.bottom > innerHeight || r.right > innerWidth) {
+        el.scrollIntoView({block: 'center', inline: 'center', behavior: 'smooth'});
+        await sleep(450);
+      }
+    },
+    async aim(el) {
+      await this.scrollTo(el);
+      const r = el.getBoundingClientRect();
+      const p = {x: r.left + r.width / 2, y: r.top + r.height / 2};
+      await this.moveTo(p.x, p.y);
+      return p;
+    },
+    highlight(el, color, text, dur) {
+      const box = mk({position: 'fixed', border: '2px solid ' + color, borderRadius: '6px', boxSizing: 'border-box',
+        boxShadow: '0 0 0 3px ' + color + '33, 0 4px 18px ' + color + '55', opacity: '0', transform: 'scale(1.04)',
+        transition: 'opacity .16s ease, transform .16s ease', zIndex: String(Z + 3)});
+      const tag = text ? mk({position: 'fixed', font: '600 11px/1 -apple-system,Roboto,sans-serif', color: '#fff',
+        background: color, padding: '3px 7px', borderRadius: '5px', whiteSpace: 'nowrap', maxWidth: '60vw',
+        overflow: 'hidden', textOverflow: 'ellipsis', opacity: '0', transition: 'opacity .16s ease', zIndex: String(Z + 4)}) : null;
+      if (tag) tag.textContent = text;
+      const place = () => {
+        const r = el.getBoundingClientRect();
+        Object.assign(box.style, {left: (r.left - 3) + 'px', top: (r.top - 3) + 'px', width: (r.width + 6) + 'px', height: (r.height + 6) + 'px'});
+        if (tag) Object.assign(tag.style, {left: (r.left - 3) + 'px', top: (r.top - 23) + 'px'});
+      };
+      place();
+      addEventListener('scroll', place, true);
+      requestAnimationFrame(() => { box.style.opacity = '1'; box.style.transform = 'scale(1)'; if (tag) tag.style.opacity = '1'; });
+      setTimeout(() => {
+        box.style.opacity = '0'; if (tag) tag.style.opacity = '0';
+        setTimeout(() => { removeEventListener('scroll', place, true); box.remove(); if (tag) tag.remove(); }, 250);
+      }, dur || HOLD);
+    },
+    frame(color) {
+      const f = mk({position: 'fixed', left: '4px', top: '4px', right: '4px', bottom: '4px', border: '2px solid ' + color,
+        borderRadius: '8px', opacity: '0', transition: 'opacity .2s ease', zIndex: String(Z + 2)});
+      requestAnimationFrame(() => { f.style.opacity = '1'; });
+      setTimeout(() => { f.style.opacity = '0'; setTimeout(() => f.remove(), 250); }, 1400);
+    },
+    ripple(x, y) {
+      const r = mk({position: 'fixed', left: x + 'px', top: y + 'px', width: '12px', height: '12px', marginLeft: '-6px',
+        marginTop: '-6px', borderRadius: '50%', border: '2px solid #22c55e', transform: 'scale(1)', opacity: '1',
+        transition: 'transform .45s ease-out, opacity .45s ease-out', zIndex: String(Z + 4)});
+      requestAnimationFrame(() => { r.style.transform = 'scale(3.6)'; r.style.opacity = '0'; });
+      setTimeout(() => r.remove(), 480);
+      const dot = mk({position: 'fixed', left: x + 'px', top: y + 'px', width: '10px', height: '10px', marginLeft: '-5px',
+        marginTop: '-5px', borderRadius: '50%', background: '#22c55e', opacity: '.9',
+        transition: 'opacity ' + HOLD + 'ms ease-out', zIndex: String(Z + 4)});
+      requestAnimationFrame(() => { dot.style.opacity = '0'; });
+      setTimeout(() => dot.remove(), HOLD + 100);
+    },
+    toast(text, kind) {
+      const p = this.pos();
+      const t = mk({position: 'fixed', left: Math.min(Math.max(p.x, 80), innerWidth - 80) + 'px', top: Math.max(p.y - 18, 34) + 'px',
+        transform: 'translate(-50%,-100%) scale(.9)', padding: '5px 11px', borderRadius: '7px',
+        font: '600 12px/1.2 -apple-system,Roboto,sans-serif', color: '#fff',
+        background: kind === 'bad' ? '#d23c33' : kind === 'info' ? '#2563eb' : '#1f9d3f',
+        boxShadow: '0 4px 14px rgba(0,0,0,.4)', opacity: '0', whiteSpace: 'nowrap', maxWidth: '80vw', overflow: 'hidden',
+        textOverflow: 'ellipsis', transition: 'opacity .18s ease, transform .18s ease', zIndex: String(Z + 6)});
+      t.textContent = text;
+      requestAnimationFrame(() => { t.style.opacity = '1'; t.style.transform = 'translate(-50%,-100%) scale(1)'; });
+      setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 220); }, HOLD);
+    },
+    async clickFx(el) { const p = await this.aim(el); this.highlight(el, '#22c55e', label(el)); this.ripple(p.x, p.y); await sleep(150); },
+    async typeFx(el) { await this.aim(el); this.highlight(el, '#2563eb', label(el), 3500); },
+    async pointFx(x, y) { await this.moveTo(x, y); this.ripple(x, y); await sleep(120); },
+  };
+  window.__DBHUD = H;
+  H.cursor();
+  return true;
+})()
+"""
+
+
+async def _hud(page, script: str, *args):
+    """Run a HUD effect; never let decoration break the real action."""
+    try:
+        await page.evaluate(HUD_JS)
+        if args:
+            await page.evaluate(script, *args)
+        else:
+            await page.evaluate(script)
+    except Exception:
+        pass
+
+
+async def _hud_on(page, selector: str, effect: str):
+    try:
+        loc = page.locator(selector).first
+        await loc.wait_for(state="visible", timeout=10000)
+        await page.evaluate(HUD_JS)
+        await loc.evaluate(f"(el) => window.__DBHUD && window.__DBHUD.{effect}(el)")
+    except Exception:
+        pass
+
+
 async def _do(tab: Tab, action: str, a: dict) -> list[dict]:
     page = tab.page
+    watched = tab.watched()
     if action == "navigate":
         url = (a.get("url") or "").strip()
         if url in ("back", "forward", "reload"):
@@ -405,8 +537,14 @@ async def _do(tab: Tab, action: str, a: dict) -> list[dict]:
             if "://" not in url and not url.startswith("about:"):
                 url = ("http://" if url.startswith(("localhost", "127.")) else "https://") + url
             await page.goto(url, wait_until="load", timeout=30000)
+        if watched:
+            await _hud(page, "(t) => window.__DBHUD.toast(t, 'info')", "opened " + (page.url.split("/")[2] if "://" in page.url else page.url))
         return [_text({"url": page.url, "title": await page.title()})]
     if action == "read":
+        if watched:
+            await _hud(page, "() => { window.__DBHUD.frame('#a855f7'); window.__DBHUD.toast('reading page', 'info'); }")
+            if a.get("selector"):
+                await _hud_on(page, a["selector"], "typeFx")
         if a.get("selector"):
             text = await page.inner_text(a["selector"], timeout=10000)
         else:
@@ -414,34 +552,50 @@ async def _do(tab: Tab, action: str, a: dict) -> list[dict]:
         return [_text({"title": await page.title(), "url": page.url, "text": text[:READ_MAX]})]
     if action == "click":
         if a.get("selector"):
+            if watched:
+                await _hud_on(page, a["selector"], "clickFx")
             await page.click(a["selector"], timeout=10000)
         elif a.get("x") is not None and a.get("y") is not None:
+            if watched:
+                await _hud(page, "([x, y]) => window.__DBHUD.pointFx(x, y)", [float(a["x"]), float(a["y"])])
             await page.mouse.click(float(a["x"]), float(a["y"]))
         else:
             raise ValueError("click needs a selector (or x,y from a real screenshot)")
         return [_text("clicked")]
     if action == "type":
         text = str(a.get("text", ""))
-        if a.get("selector") and not a.get("trusted"):
-            await page.fill(a["selector"], text, timeout=10000)
+        sel = a.get("selector")
+        if sel and watched:
+            await _hud_on(page, sel, "typeFx")
+        if sel and not a.get("trusted") and not (watched and len(text) <= 200):
+            await page.fill(sel, text, timeout=10000)
         else:
-            if a.get("selector"):
-                await page.click(a["selector"], timeout=10000)
-            await page.keyboard.type(text)
+            if sel:
+                if not a.get("trusted"):
+                    await page.fill(sel, "", timeout=10000)   # replace, like fill
+                await page.click(sel, timeout=10000)
+            # Watched: real keystrokes at a readable pace, so you see it being typed.
+            await page.keyboard.type(text, delay=35 if watched else 0)
         if a.get("submit"):
             await page.keyboard.press("Enter")
         return [_text("typed")]
     if action == "key":
+        if watched:
+            await _hud(page, "(k) => window.__DBHUD.toast('⌨ ' + k, 'info')", str(a.get("key") or "Enter"))
         await page.keyboard.press(str(a.get("key") or "Enter"))
         return [_text("pressed " + str(a.get("key")))]
     if action == "screenshot":
         data = await page.screenshot(type="jpeg", quality=80, scale="css", full_page=bool(a.get("fullPage")))
+        if watched:
+            await _hud(page, "() => window.__DBHUD.frame('#f59e0b')")
         return [{"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/jpeg"}]
     if action == "eval":
         value = await page.evaluate(str(a.get("code") or "undefined"))
         return [_text(value)]
     if action == "wait_for":
         start = time.time()
+        if watched:
+            await _hud(page, "(s) => window.__DBHUD.toast('waiting for ' + s, 'info')", str(a["selector"])[:60])
         await page.wait_for_selector(a["selector"], state="visible" if a.get("visible") else "attached",
                                      timeout=float(a.get("timeoutMs") or 10000))
         return [_text({"found": True, "waitedMs": int((time.time() - start) * 1000)})]
@@ -598,20 +752,34 @@ async def browser_config(request: Request):
 
 async def view_socket(ws: WebSocket, owner: str):
     """Live view: JPEG frames as binary messages, page info as JSON; input comes back as JSON
-    {type: tap|scroll|text|key|navigate|back|forward|reload|resize}. Coordinates are 0–1."""
+    {type: tap|scroll|text|key|navigate|back|forward|reload|resize}. Coordinates are 0–1.
+
+    ?follow=1 (the split screen under a Claude session): only attaches to a tab that is already
+    open, doesn't keep it open, and gets {type: closed} when the tab is released."""
     _valid_owner(owner)
     await ws.accept()
-    try:
-        tab = await pool.acquire(owner, wait=15, priority=True)
-    except Busy as e:
-        await ws.send_json({"type": "error", "message": str(e)})
-        await ws.close()
-        return
-    except Exception as e:
-        await ws.send_json({"type": "error", "message": f"browser failed to start: {e}"})
-        await ws.close()
-        return
-    tab.viewers += 1
+    follow = ws.query_params.get("follow") == "1"
+    if follow:
+        tab = pool.tabs.get(owner)
+        if tab is None or tab.page.is_closed():
+            await ws.send_json({"type": "closed"})
+            await ws.close()
+            return
+    else:
+        try:
+            tab = await pool.acquire(owner, wait=15, priority=True)
+        except Busy as e:
+            await ws.send_json({"type": "error", "message": str(e)})
+            await ws.close()
+            return
+        except Exception as e:
+            await ws.send_json({"type": "error", "message": f"browser failed to start: {e}"})
+            await ws.close()
+            return
+    if follow:
+        tab.followers += 1
+    else:
+        tab.viewers += 1
     page = tab.page
     first_url = ws.query_params.get("url")
     last = {"hash": "", "at": 0.0}
@@ -655,6 +823,13 @@ async def view_socket(ws: WebSocket, owner: str):
         # always has a current picture (and gets one at all if screencast isn't available).
         while True:
             await asyncio.sleep(1.0)
+            if page.is_closed() or pool.tabs.get(owner) is not tab:
+                try:
+                    await ws.send_json({"type": "closed"})
+                    await ws.close()
+                except Exception:
+                    pass
+                return
             if time.time() - last["at"] > 1.5:
                 try:
                     await send_frame(await page.screenshot(type="jpeg", quality=60, timeout=3000))
@@ -713,8 +888,11 @@ async def view_socket(ws: WebSocket, owner: str):
             page.remove_listener("framenavigated", on_nav)
         except Exception:
             pass
-        tab.viewers = max(0, tab.viewers - 1)
-        tab.last_used = time.time()
+        if follow:
+            tab.followers = max(0, tab.followers - 1)
+        else:
+            tab.viewers = max(0, tab.viewers - 1)
+            tab.last_used = time.time()
         if cdp is not None:
             try:
                 await cdp.send("Page.stopScreencast")
