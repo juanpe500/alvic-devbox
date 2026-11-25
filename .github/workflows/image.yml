@@ -24,6 +24,8 @@ jobs:
         run: |
           sudo apt-get install -y tmux ripgrep >/dev/null
           pip install -q -r agent/requirements.txt websockets
+          # Fixed path like the image (/opt/pw-browsers): HOME changes below.
+          export PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers
           playwright install --with-deps --only-shell chromium >/dev/null
           # Like the image: a `claude` in ~/.local/bin that login shells find first (here the fake).
           mkdir -p /tmp/devhome/.local/bin
