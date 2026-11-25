@@ -57,6 +57,10 @@ check("job stop", stopped["running"] is False, str(stopped))
 d = c.post("/fs/delete", json={"path": "repos/demo", "recursive": True})
 check("delete recursive", d.status_code == 200, d.text)
 
+u = c.post("/update").json()
+st = c.get("/update").json()
+check("update request leaves a file for the host watcher", u.get("ok") and st.get("pending") is True, str(st))
+
 
 async def pty():
     url = f"ws://127.0.0.1:7799/pty?token={TOKEN}&cols=100&rows=30&session=smoke"

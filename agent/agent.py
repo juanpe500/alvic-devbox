@@ -13,6 +13,9 @@ Surface:
   *    /proxy/{port}/{path}        HTTP proxy to 127.0.0.1:{port} — previews never leave the tailnet
   WS   /pty                        interactive terminal, attached to a tmux session so it
                                    survives the phone disconnecting
+  /claude/…                        Claude Code session manager: many parallel named sessions
+                                   (tmux `cc-<id>`), live state via hooks, Remote Control,
+                                   resume by UUID, conversation history and transcripts
 """
 
 from __future__ import annotations
@@ -33,10 +36,10 @@ import uuid
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
-VERSION = "1"
+VERSION = "2"
 HOME = Path(os.environ.get("HOME", "/home/dev")).resolve()
 TOKEN = os.environ.get("AGENT_TOKEN", "")
 STATE_DIR = HOME / ".devbox"
@@ -414,6 +417,439 @@ async def proxy(port: int, path: str, request: Request):
         (k.lower().encode("latin-1"), v.encode("latin-1"))
         for k, v in upstream.headers.multi_items() if k.lower() not in _HOP)
     return response
+
+
+# ── self-update ─────────────────────────────────────────────────────────────
+# The container can't touch Docker. It drops a request file in its own home volume; the
+# host's alvic-devbox-updater.path (installed by install.sh) sees it, re-runs the official
+# installer, and writes update-status.json back into the volume.
+
+UPDATE_REQUEST = STATE_DIR / "update-request"
+UPDATE_STATUS = STATE_DIR / "update-status.json"
+
+
+@app.get("/update")
+def update_status():
+    try:
+        status = json.loads(UPDATE_STATUS.read_text())
+    except (OSError, ValueError):
+        status = {}
+    return {"version": VERSION, "pending": UPDATE_REQUEST.exists(), "status": status}
+
+
+@app.post("/update")
+def update_request():
+    UPDATE_REQUEST.write_text(json.dumps({"requested_at": int(time.time())}))
+    return {"ok": True, "version": VERSION}
+
+
+# ── Claude Code sessions ────────────────────────────────────────────────────
+#
+# Same model as chrome-terminal (server/session-cmd.js + claude-hook.js), on tmux:
+#  * each session runs `claude` in its own tmux session `cc-<id>`; the phone attaches
+#    to it through /pty?session=cc-<id>, so it survives disconnects
+#  * the conversation UUID is pinned at launch with --session-id, so --resume is exact
+#    (the --remote-control FLAG ignores --session-id, so RC is enabled afterwards with
+#    the /remote-control slash command instead)
+#  * hooks injected with --settings write busy/idle/waiting + permission mode per session
+#  * the registry survives container restarts: sessions that were running are relaunched
+#    with --resume <uuid> on agent startup
+
+CC_DIR = STATE_DIR / "claude"
+CC_STATE = CC_DIR / "state"
+CC_REGISTRY = CC_DIR / "sessions.json"
+CC_HOOKS = CC_DIR / "hooks.json"
+CC_HOOK_SCRIPT = Path(__file__).with_name("claude_hook.py")
+PROJECTS = HOME / ".claude" / "projects"
+CC_STATE.mkdir(parents=True, exist_ok=True)
+
+
+def _write_hooks():
+    cmd = lambda ev: f"python3 {CC_HOOK_SCRIPT} {ev}"   # noqa: E731
+    CC_HOOKS.write_text(json.dumps({"hooks": {
+        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("prompt")}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": cmd("stop")}]}],
+        "Notification": [{"hooks": [{"type": "command", "command": cmd("notify")}]}],
+        "SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": cmd("start")}]}],
+    }}, indent=2))
+
+
+def _load_registry() -> dict:
+    try:
+        return json.loads(CC_REGISTRY.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_registry(reg: dict) -> None:
+    tmp = CC_REGISTRY.with_suffix(".tmp")
+    tmp.write_text(json.dumps(reg, indent=2))
+    tmp.replace(CC_REGISTRY)
+
+
+def _tmux(*args, timeout=10) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout,
+                          env=_child_env())
+
+
+def _children() -> dict[int, list[tuple[int, str]]]:
+    """ppid -> [(pid, cmdline)] for every process, read from /proc."""
+    kids: dict[int, list[tuple[int, str]]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            cmd = Path(f"/proc/{entry}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except (OSError, ValueError, IndexError):
+            continue
+        kids.setdefault(ppid, []).append((int(entry), cmd))
+    return kids
+
+
+def _runs_claude(pid: int, kids: dict, depth: int = 0) -> bool:
+    for child, cmd in kids.get(pid, []):
+        if "claude" in cmd.split(" ", 2)[0] or " claude " in f" {cmd} "[:200].replace("/", " "):
+            return True
+        if depth < 3 and _runs_claude(child, kids, depth + 1):
+            return True
+    return False
+
+
+def _tmux_alive() -> dict[str, str]:
+    """tmux session name -> "claude" while claude runs in it, else "bash".
+    (tmux's #{pane_current_command} reports the `bash -lc` wrapper, not claude: a
+    non-interactive bash keeps its child in its own process group.)"""
+    out = _tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}")
+    kids = _children()
+    alive = {}
+    for line in out.stdout.splitlines():
+        name, _, pid = line.partition("\t")
+        if name in alive or not pid.isdigit():
+            continue
+        alive[name] = "claude" if _runs_claude(int(pid), kids) else "bash"
+    return alive
+
+
+def _project_dir(cwd: str) -> Path:
+    # Claude escapes the cwd by replacing every non-alphanumeric char with '-'.
+    return PROJECTS / "".join(c if c.isalnum() else "-" for c in cwd)
+
+
+def _claude_cmd(sess: dict, resume: bool) -> str:
+    parts = ["claude", "--resume" if resume else "--session-id", sess["uuid"],
+             "--settings", str(CC_HOOKS)]
+    if sess.get("model"):
+        parts += ["--model", sess["model"]]
+    if sess.get("permission_mode") and sess["permission_mode"] != "default":
+        parts += ["--permission-mode", sess["permission_mode"]]
+    return " ".join(_q(p) for p in parts)
+
+
+def _q(s: str) -> str:
+    return s if all(c.isalnum() or c in "-_./:=@" for c in s) else "'" + s.replace("'", "'\\''") + "'"
+
+
+def _trust_folder(cwd: str) -> None:
+    """Mark the folder trusted in ~/.claude.json, as tapping "Yes, I trust this folder" would.
+    Otherwise the first launch in a new folder stops on that dialog — and the automatic
+    /remote-control keystrokes would land on it."""
+    cfg_path = HOME / ".claude.json"
+    try:
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    except (OSError, ValueError):
+        return   # never rewrite a config we couldn't parse
+    project = cfg.setdefault("projects", {}).setdefault(cwd, {})
+    if project.get("hasTrustDialogAccepted"):
+        return
+    project["hasTrustDialogAccepted"] = True
+    tmp = cfg_path.with_name(".claude.json.devbox-tmp")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    tmp.replace(cfg_path)
+
+
+def _launch(sess: dict, resume: bool) -> None:
+    _trust_folder(sess["cwd"])
+    tname = "cc-" + sess["id"]
+    cmd = _claude_cmd(sess, resume)
+    _tmux("new-session", "-d", "-s", tname, "-c", sess["cwd"], "-x", "120", "-y", "40",
+          "-e", f"DEVBOX_CC_ID={sess['id']}",
+          "bash", "-lc", f"{cmd}; exec bash -l")
+    if sess.get("rc"):
+        _send_rc_later(tname)
+
+
+def _send_rc_later(tname: str, delay: float = 6.0) -> None:
+    def go():
+        time.sleep(delay)
+        _tmux("send-keys", "-t", tname, "/remote-control", "Enter")
+    import threading
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _session_view(sess: dict, alive: dict) -> dict:
+    tname = "cc-" + sess["id"]
+    fg = alive.get(tname)
+    st = {}
+    try:
+        st = json.loads((CC_STATE / f"{sess['id']}.json").read_text())
+    except (OSError, ValueError):
+        pass
+    if fg is None:
+        status = "stopped"
+    elif fg in ("bash", "sh", "zsh"):
+        status = "exited"            # claude quit, the shell is still there
+    else:
+        status = st.get("state", "idle")
+    transcript = _project_dir(sess["cwd"]) / f"{sess['uuid']}.jsonl"
+    try:
+        last = transcript.stat().st_mtime
+    except OSError:
+        last = sess.get("created_at", 0)
+    return {**sess, "tmux": tname, "status": status, "mode": st.get("mode", "default"),
+            "last_activity": int(last), "cwd_rel": _rel(Path(sess["cwd"])) if sess["cwd"].startswith(str(HOME)) else sess["cwd"]}
+
+
+def _new_id(name: str) -> str:
+    slug = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-")[:24] or "claude"
+    return f"{slug}-{uuid.uuid4().hex[:4]}"
+
+
+@app.on_event("startup")
+def _claude_startup():
+    _write_hooks()
+    reg = _load_registry()
+    alive = _tmux_alive()
+    for sess in reg.values():
+        # A container restart killed tmux: relaunch what was running, same conversation.
+        if sess.get("wanted", True) and ("cc-" + sess["id"]) not in alive and shutil.which("claude"):
+            _launch(sess, resume=True)
+
+
+@app.get("/claude/sessions")
+def cc_list():
+    reg = _load_registry()
+    alive = _tmux_alive()
+    items = [_session_view(s, alive) for s in reg.values()]
+    order = {"waiting": 0, "busy": 1, "idle": 2, "exited": 3, "stopped": 4}
+    items.sort(key=lambda s: (order.get(s["status"], 9), -s["last_activity"]))
+    return {"sessions": items}
+
+
+@app.post("/claude/sessions")
+async def cc_create(request: Request):
+    body = await request.json()
+    cwd = _safe(body.get("cwd") or "repos")
+    if not cwd.is_dir():
+        raise HTTPException(400, "folder not found")
+    name = (body.get("name") or "").strip() or f"{cwd.name}-{uuid.uuid4().int % 900 + 100}"
+    resume_uuid = (body.get("resume") or "").strip()
+    reg = _load_registry()
+    if resume_uuid:
+        if any(s["uuid"] == resume_uuid for s in reg.values() if ("cc-" + s["id"]) in _tmux_alive()):
+            raise HTTPException(409, "that conversation is already open in another session")
+        try:
+            uuid.UUID(resume_uuid)
+        except ValueError:
+            raise HTTPException(400, "bad conversation id")
+    sess = {
+        "id": _new_id(name), "name": name[:60], "icon": (body.get("icon") or "✦")[:4],
+        "cwd": str(cwd), "uuid": resume_uuid or str(uuid.uuid4()),
+        "model": (body.get("model") or "").strip() or None,
+        "permission_mode": (body.get("permission_mode") or "default").strip(),
+        "rc": bool(body.get("rc")), "created_at": int(time.time()), "wanted": True,
+    }
+    reg[sess["id"]] = sess
+    _save_registry(reg)
+    _launch(sess, resume=bool(resume_uuid))
+    return _session_view(sess, _tmux_alive())
+
+
+@app.post("/claude/sessions/{sid}")
+async def cc_update(sid: str, request: Request):
+    """Rename / change icon."""
+    reg = _load_registry()
+    if sid not in reg:
+        raise HTTPException(404, "no such session")
+    body = await request.json()
+    if (body.get("name") or "").strip():
+        reg[sid]["name"] = body["name"].strip()[:60]
+    if (body.get("icon") or "").strip():
+        reg[sid]["icon"] = body["icon"].strip()[:4]
+    _save_registry(reg)
+    return _session_view(reg[sid], _tmux_alive())
+
+
+@app.post("/claude/sessions/{sid}/rc")
+def cc_remote_control(sid: str):
+    reg = _load_registry()
+    if sid not in reg:
+        raise HTTPException(404, "no such session")
+    reg[sid]["rc"] = True
+    _save_registry(reg)
+    _send_rc_later("cc-" + sid, delay=0)
+    return {"ok": True}
+
+
+@app.post("/claude/sessions/{sid}/start")
+def cc_start(sid: str):
+    """Relaunch a stopped/exited session on the same conversation."""
+    reg = _load_registry()
+    if sid not in reg:
+        raise HTTPException(404, "no such session")
+    sess = reg[sid]
+    tname = "cc-" + sid
+    alive = _tmux_alive()
+    if tname in alive:
+        if alive[tname] not in ("bash", "sh", "zsh"):
+            return _session_view(sess, alive)                      # already running
+        _tmux("send-keys", "-t", tname, _claude_cmd(sess, resume=True), "Enter")
+    else:
+        _launch(sess, resume=True)
+    sess["wanted"] = True
+    _save_registry(reg)
+    return _session_view(sess, _tmux_alive())
+
+
+@app.delete("/claude/sessions/{sid}")
+def cc_close(sid: str, forget: bool = False):
+    """Stop the session (its conversation stays in history and can be resumed)."""
+    reg = _load_registry()
+    if sid not in reg:
+        raise HTTPException(404, "no such session")
+    _tmux("kill-session", "-t", "cc-" + sid)
+    if forget:
+        reg.pop(sid)
+        (CC_STATE / f"{sid}.json").unlink(missing_ok=True)
+    else:
+        reg[sid]["wanted"] = False
+    _save_registry(reg)
+    return {"ok": True}
+
+
+def _transcript_preview(path: Path) -> dict:
+    """Last human prompt + last assistant reply from the tail of a transcript."""
+    last_user = last_assistant = ""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 256 * 1024))
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+        if size > 256 * 1024:
+            lines = lines[1:]
+        for raw in reversed(lines):
+            if last_user and last_assistant:
+                break
+            try:
+                o = json.loads(raw)
+            except ValueError:
+                continue
+            if o.get("isSidechain") or not o.get("message"):
+                continue
+            content = o["message"].get("content")
+            if not last_assistant and o.get("type") == "assistant" and isinstance(content, list):
+                t = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text").strip()
+                if t:
+                    last_assistant = t[:400]
+            elif not last_user and o.get("type") == "user" and isinstance(content, str):
+                t = content.strip()
+                if t and not t.startswith("<"):
+                    last_user = t[:400]
+    except OSError:
+        pass
+    return {"last_user": last_user, "last_assistant": last_assistant}
+
+
+def _live_uuids() -> set[str]:
+    alive = _tmux_alive()
+    return {s["uuid"] for s in _load_registry().values()
+            if alive.get("cc-" + s["id"]) not in (None, "bash", "sh", "zsh")}
+
+
+@app.get("/claude/conversations")
+def cc_conversations(cwd: str = "", limit: int = 30):
+    """Past conversations, newest first — for one folder (cwd) or across all projects."""
+    if cwd:
+        dirs = [_project_dir(str(_safe(cwd)))]
+    else:
+        dirs = [d for d in PROJECTS.iterdir() if d.is_dir()] if PROJECTS.is_dir() else []
+    files = []
+    for d in dirs:
+        for f in d.glob("*.jsonl") if d.is_dir() else []:
+            try:
+                files.append((f.stat().st_mtime, f))
+            except OSError:
+                pass
+    files.sort(reverse=True)
+    live = _live_uuids()
+    out = []
+    for mtime, f in files[:max(1, min(limit, 100))]:
+        cwd_guess = _conversation_cwd(f)
+        out.append({"uuid": f.stem, "mtime": int(mtime), "size": f.stat().st_size,
+                    "cwd": cwd_guess, "cwd_rel": _rel(Path(cwd_guess)) if cwd_guess.startswith(str(HOME)) else cwd_guess,
+                    "live": f.stem in live, **_transcript_preview(f)})
+    return {"conversations": out}
+
+
+def _conversation_cwd(path: Path) -> str:
+    """The real cwd recorded in the transcript (the dir name is lossy)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for _ in range(40):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except ValueError:
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return ""
+
+
+@app.get("/claude/transcript")
+def cc_transcript(uuid_: str = Query("", alias="uuid"), cwd: str = "", limit: int = 200):
+    """Readable messages (user + assistant text, tool calls summarized) of one conversation."""
+    if not uuid_:
+        raise HTTPException(400, "uuid required")
+    try:
+        uuid.UUID(uuid_)
+    except ValueError:
+        raise HTTPException(400, "bad uuid")
+    candidates = [_project_dir(str(_safe(cwd))) / f"{uuid_}.jsonl"] if cwd else list(PROJECTS.glob(f"*/{uuid_}.jsonl"))
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        raise HTTPException(404, "conversation not found")
+    msgs = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                o = json.loads(raw)
+            except ValueError:
+                continue
+            if o.get("isSidechain") or o.get("type") not in ("user", "assistant") or not o.get("message"):
+                continue
+            content = o["message"].get("content")
+            if o["type"] == "user":
+                if isinstance(content, str) and content.strip() and not content.startswith("<"):
+                    msgs.append({"role": "user", "text": content.strip()[:4000], "ts": o.get("timestamp")})
+                continue
+            if isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text" and b.get("text", "").strip():
+                        msgs.append({"role": "assistant", "text": b["text"].strip()[:4000], "ts": o.get("timestamp")})
+                    elif b.get("type") == "tool_use":
+                        detail = b.get("input", {})
+                        hint = detail.get("command") or detail.get("file_path") or detail.get("pattern") or ""
+                        msgs.append({"role": "tool", "text": f"{b.get('name', 'tool')} {str(hint)[:160]}".strip(),
+                                     "ts": o.get("timestamp")})
+    return {"uuid": uuid_, "cwd": _conversation_cwd(path), "messages": msgs[-max(1, min(limit, 1000)):]}
 
 
 # ── terminal ────────────────────────────────────────────────────────────────

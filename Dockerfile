@@ -35,7 +35,7 @@ RUN useradd -m -s /bin/bash dev \
 COPY agent/requirements.txt /opt/agent/requirements.txt
 RUN python3 -m venv /opt/agent/.venv \
     && /opt/agent/.venv/bin/pip install --no-cache-dir -r /opt/agent/requirements.txt
-COPY agent/agent.py /opt/agent/agent.py
+COPY agent/agent.py agent/claude_hook.py /opt/agent/
 
 USER dev
 WORKDIR /home/dev
