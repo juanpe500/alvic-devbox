@@ -35,7 +35,13 @@ RUN useradd -m -s /bin/bash dev \
 COPY agent/requirements.txt /opt/agent/requirements.txt
 RUN python3 -m venv /opt/agent/.venv \
     && /opt/agent/.venv/bin/pip install --no-cache-dir -r /opt/agent/requirements.txt
-COPY agent/agent.py agent/claude_hook.py /opt/agent/
+# Headless Chromium for the shared browser (browser.py) — the "headless shell" build, the
+# lightest one (~120 MB + ~40–130 MB per tab), plus its system libraries.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN /opt/agent/.venv/bin/playwright install --with-deps --only-shell chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod -R a+rX /opt/pw-browsers
+COPY agent/agent.py agent/browser.py agent/claude_hook.py /opt/agent/
 
 USER dev
 WORKDIR /home/dev

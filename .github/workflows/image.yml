@@ -24,15 +24,18 @@ jobs:
         run: |
           sudo apt-get install -y tmux ripgrep >/dev/null
           pip install -q -r agent/requirements.txt websockets
+          playwright install --with-deps --only-shell chromium >/dev/null
           # Like the image: a `claude` in ~/.local/bin that login shells find first (here the fake).
           mkdir -p /tmp/devhome/.local/bin
           cp tests/fake_claude /tmp/devhome/.local/bin/claude && chmod +x /tmp/devhome/.local/bin/claude
           printf 'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"\n' > /tmp/devhome/.profile
           export HOME=/tmp/devhome PATH="/tmp/devhome/.local/bin:$PATH" AGENT_TOKEN=testtoken
+          export DEVBOX_AGENT_URL=http://127.0.0.1:7799
           uvicorn agent:app --app-dir agent --host 127.0.0.1 --port 7799 > /tmp/agent.log 2>&1 &
           sleep 3
           python tests/agent_smoke.py || { cat /tmp/agent.log; exit 1; }
           python tests/claude_smoke.py || { cat /tmp/agent.log; exit 1; }
+          python tests/browser_smoke.py || { cat /tmp/agent.log; exit 1; }
 
   build:
     needs: agent-smoke

@@ -41,6 +41,6 @@ unset TS_AUTHKEY
 exec runuser -u dev -- env -i \
     HOME=/home/dev USER=dev SHELL=/bin/bash LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     PATH="/home/dev/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    AGENT_TOKEN="$AGENT_TOKEN" \
+    AGENT_TOKEN="$AGENT_TOKEN" PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
     /opt/agent/.venv/bin/uvicorn agent:app --app-dir /opt/agent \
         --host 127.0.0.1 --port 7777 --ws-ping-interval 20

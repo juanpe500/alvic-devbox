@@ -16,6 +16,8 @@ Surface:
   /claude/…                        Claude Code session manager: many parallel named sessions
                                    (tmux `cc-<id>`), live state via hooks, Remote Control,
                                    resume by UUID, conversation history and transcripts
+  /mcp/browser/…, /browser/…       shared headless Chromium: Claude drives it over MCP, the
+                                   phone watches it live (see browser.py)
 """
 
 from __future__ import annotations
@@ -39,9 +41,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
-VERSION = "2"
+import browser
+
+VERSION = "3"
 HOME = Path(os.environ.get("HOME", "/home/dev")).resolve()
 TOKEN = os.environ.get("AGENT_TOKEN", "")
+AGENT_URL = os.environ.get("DEVBOX_AGENT_URL", "http://127.0.0.1:7777")
 STATE_DIR = HOME / ".devbox"
 JOBS_DIR = STATE_DIR / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,6 +57,7 @@ LIST_MAX = 2000
 EXEC_MAX_TIMEOUT = 900
 
 app = FastAPI(title="alvic-devbox", version=VERSION, docs_url=None, redoc_url=None)
+app.include_router(browser.router)
 
 
 # ── auth ────────────────────────────────────────────────────────────────────
@@ -459,19 +465,47 @@ CC_DIR = STATE_DIR / "claude"
 CC_STATE = CC_DIR / "state"
 CC_REGISTRY = CC_DIR / "sessions.json"
 CC_HOOKS = CC_DIR / "hooks.json"
+CC_MCP = CC_DIR / "mcp"
 CC_HOOK_SCRIPT = Path(__file__).with_name("claude_hook.py")
 PROJECTS = HOME / ".claude" / "projects"
 CC_STATE.mkdir(parents=True, exist_ok=True)
+CC_MCP.mkdir(parents=True, exist_ok=True)
 
 
 def _write_hooks():
     cmd = lambda ev: f"python3 {CC_HOOK_SCRIPT} {ev}"   # noqa: E731
-    CC_HOOKS.write_text(json.dumps({"hooks": {
-        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("prompt")}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": cmd("stop")}]}],
-        "Notification": [{"hooks": [{"type": "command", "command": cmd("notify")}]}],
-        "SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": cmd("start")}]}],
-    }}, indent=2))
+    CC_HOOKS.write_text(json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("prompt")}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": cmd("stop")}]}],
+            "Notification": [{"hooks": [{"type": "command", "command": cmd("notify")}]}],
+            "SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": cmd("start")}]}],
+        },
+        # The devbox browser is this machine's own tool; don't stop to ask before each use.
+        "permissions": {"allow": ["mcp__browser"]},
+    }, indent=2))
+
+
+def _mcp_config(sid: str) -> Path:
+    """Per-session MCP config: the session's own tab in the shared browser."""
+    path = CC_MCP / f"{sid}.json"
+    path.write_text(json.dumps({"mcpServers": {"browser": {
+        "type": "http", "url": f"{AGENT_URL}/mcp/browser/{sid}",
+        "headers": {"Authorization": f"Bearer {TOKEN}"},
+    }}}))
+    path.chmod(0o600)
+    return path
+
+
+def _browser_owners() -> dict:
+    out = {}
+    for sid, sess in _load_registry().items():
+        try:
+            st = json.loads((CC_STATE / f"{sid}.json").read_text())
+        except (OSError, ValueError):
+            st = {}
+        out[sid] = {"name": sess.get("name"), "state": st.get("state"), "ts": st.get("ts")}
+    return out
 
 
 def _load_registry() -> dict:
@@ -539,7 +573,7 @@ def _project_dir(cwd: str) -> Path:
 
 def _claude_cmd(sess: dict, resume: bool) -> str:
     parts = ["claude", "--resume" if resume else "--session-id", sess["uuid"],
-             "--settings", str(CC_HOOKS)]
+             "--settings", str(CC_HOOKS), "--mcp-config", str(_mcp_config(sess["id"]))]
     if sess.get("model"):
         parts += ["--model", sess["model"]]
     if sess.get("permission_mode") and sess["permission_mode"] != "default":
@@ -614,6 +648,26 @@ def _session_view(sess: dict, alive: dict) -> dict:
 def _new_id(name: str) -> str:
     slug = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-")[:24] or "claude"
     return f"{slug}-{uuid.uuid4().hex[:4]}"
+
+
+@app.on_event("startup")
+async def _browser_startup():
+    browser.pool.owner_info = _browser_owners
+    asyncio.get_running_loop().create_task(browser.pool.reaper())
+
+
+@app.on_event("shutdown")
+async def _browser_shutdown():
+    await browser.pool.shutdown()
+
+
+@app.websocket("/browser/view/{owner}")
+async def browser_view(ws: WebSocket, owner: str):
+    raw = _bearer(ws.headers.get("authorization")) or ws.query_params.get("token")
+    if not _token_ok(raw):
+        await ws.close(code=4401)
+        return
+    await browser.view_socket(ws, owner)
 
 
 @app.on_event("startup")

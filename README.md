@@ -27,7 +27,8 @@ The only way in is your own [Tailscale](https://tailscale.com) network.
 | | |
 |---|---|
 | **Terminal** | A real interactive terminal in Alvic, backed by tmux. Sessions keep running when you leave the app, and reopening re-attaches. |
-| **Claude Code** | Preinstalled. Open it from Alvic, or let Alvic's assistant hand coding tasks to it. |
+| **Claude Code** | Preinstalled. Run several named sessions in parallel from Alvic, with live status, Remote Control and resume. |
+| **Browser** | A headless Chromium that Claude drives through MCP (navigate, click, type, read, screenshot, batch) to test what it builds. Watch any tab live in Alvic and take over with a tap. Tabs are pooled by RAM and saved (screenshot, URL, scroll) when a session finishes. |
 | **Repos** | `~/repos` on a persistent volume. Clone, pull, commit and push with `git` / `gh`. |
 | **Files** | Browse and edit any file from the phone. Deleting a non-empty folder always asks first. |
 | **Jobs** | Background processes for dev servers, installs and long builds, with live logs. |
@@ -131,7 +132,9 @@ Data lives in the Docker volumes `alvic-devbox-home` (your home folder and repos
 ```
 Dockerfile          Ubuntu 24.04 + git, gh, python, node, ripgrep, tmux, tailscale, Claude Code
 entrypoint.sh       tailscale (userspace) + `tailscale serve` → agent
-agent/agent.py      FastAPI agent: files, exec, jobs, ports, HTTP proxy, WebSocket PTY (tmux)
+agent/agent.py      FastAPI agent: files, exec, jobs, ports, HTTP proxy, WebSocket PTY (tmux),
+                    Claude Code session manager
+agent/browser.py    shared headless Chromium: MCP tools, tab pool, save/restore, live view
 install.sh          pull/build, network, firewall (systemd unit), container
-tests/              agent smoke test (runs in CI before every image build)
+tests/              smoke tests for the agent, Claude sessions and browser (run in CI before every build)
 ```
