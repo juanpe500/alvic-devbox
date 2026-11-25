@@ -81,6 +81,28 @@ check("pty roundtrip", asyncio.run(pty()))
 time.sleep(0.5)
 sess = c.post("/exec", json={"command": "tmux has-session -t smoke && echo alive"}).json()
 check("tmux session survives disconnect", "alive" in sess["stdout"], str(sess))
+opts = c.post("/exec", json={"command": "tmux show -gv mouse; tmux show -gv status-position"}).json()["stdout"].split()
+check("tmux: mouse on, status bar on top", opts == ["on", "top"], str(opts))
+
+
+async def scroll_back():
+    # Swipe up in a shell = wheel events → tmux history (copy mode); typing first cancels it.
+    url = f"ws://127.0.0.1:7799/pty?token={TOKEN}&cols=100&rows=30&session=smoke"
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"type": "input", "data": "seq 1 200\r"}))
+        await asyncio.sleep(1.5)
+        await ws.send(b"\x1b[<64;50;15M\x1b[<64;50;15M")
+        await asyncio.sleep(1)
+        entered = c.post("/exec", json={"command": "tmux display -p -t smoke '#{pane_in_mode}'"}).json()["stdout"].strip()
+        await ws.send(json.dumps({"type": "cancel-scroll"}))
+        await asyncio.sleep(1)
+        left = c.post("/exec", json={"command": "tmux display -p -t smoke '#{pane_in_mode}'"}).json()["stdout"].strip()
+        return entered, left
+
+
+entered, left = asyncio.run(scroll_back())
+check("swipe up in a shell enters tmux history", entered == "1", entered)
+check("cancel-scroll leaves it before typing", left == "0", left)
 c.post("/exec", json={"command": "tmux kill-session -t smoke"})
 
 print("\nFAILED: " + ", ".join(fails) if fails else "\nALL PASS")

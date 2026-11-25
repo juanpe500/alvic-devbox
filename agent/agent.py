@@ -603,11 +603,19 @@ def _trust_folder(cwd: str) -> None:
     tmp.replace(cfg_path)
 
 
+# Server-wide tmux options, applied before every new session (`start-server ; set … ; new-session`):
+#  * mouse on: a swipe in Alvic arrives as wheel events — full-screen apps that want the mouse
+#    (Claude Code) scroll themselves, plain shells scroll tmux's history (copy mode)
+#  * status bar at the top, under the session name in Alvic; long history for shells
+TMUX_OPTS = ["start-server", ";", "set", "-g", "mouse", "on", ";", "set", "-g", "status-position", "top",
+             ";", "set", "-g", "history-limit", "50000", ";"]
+
+
 def _launch(sess: dict, resume: bool) -> None:
     _trust_folder(sess["cwd"])
     tname = "cc-" + sess["id"]
     cmd = _claude_cmd(sess, resume)
-    _tmux("new-session", "-d", "-s", tname, "-c", sess["cwd"], "-x", "120", "-y", "40",
+    _tmux(*TMUX_OPTS, "new-session", "-d", "-s", tname, "-c", sess["cwd"], "-x", "120", "-y", "40",
           "-e", f"DEVBOX_CC_ID={sess['id']}",
           "bash", "-lc", f"{cmd}; exec bash -l")
     if sess.get("rc"):
@@ -931,7 +939,7 @@ async def pty_socket(ws: WebSocket):
 
     # tmux keeps the shell (and anything like `claude` running in it) alive when
     # the phone drops the socket; reconnecting with the same session re-attaches.
-    argv = ["tmux", "new-session", "-A", "-s", session, "-c", str(cwd)]
+    argv = ["tmux", *TMUX_OPTS, "new-session", "-A", "-s", session, "-c", str(cwd)]
     if startup:
         argv += ["bash", "-lc", f"{startup}; exec bash -l"]
     proc = subprocess.Popen(
@@ -982,6 +990,11 @@ async def pty_socket(ws: WebSocket):
                 os.write(master, (frame.get("data") or "").encode())
             elif frame.get("type") == "resize":
                 _set_size(master, int(frame.get("cols") or cols), int(frame.get("rows") or rows))
+            elif frame.get("type") == "cancel-scroll":
+                # Leave tmux's history view (entered by swiping up in a shell) before typing,
+                # so keystrokes reach the program instead of copy mode.
+                await asyncio.to_thread(_tmux, "if-shell", "-F", "-t", session, "#{pane_in_mode}",
+                                        "send-keys -X cancel")
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
